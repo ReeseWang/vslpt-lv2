@@ -7,18 +7,18 @@ PKG_CONFIG?=pkg-config
 STRIP?=strip
 STRIPFLAGS?=-s
 
-midifilter_VERSION?=$(shell git describe --tags HEAD 2>/dev/null | sed 's/-g.*$$//;s/^v//' || echo "LV2")
+vslpt_VERSION?=$(shell git describe --tags HEAD 2>/dev/null | sed 's/-g.*$$//;s/^v//' || echo "LV2")
 ###############################################################################
 
 LV2DIR ?= $(PREFIX)/lib/lv2
 LOADLIBES=-lm
-LV2NAME=midifilter
-BUNDLE=midifilter.lv2
+LV2NAME=vslpt
+BUNDLE=vslpt-lv2
 BUILDDIR=build/
 targets=
 
 ifneq ($(MOD),)
-  MODBRAND=mod:brand \"x42\";
+  MODBRAND=mod:brand \"ReeseWang\";
   GREPEXCL="^^^^"
 else
   GREPEXCL=mod:label[^;]*;
@@ -56,7 +56,7 @@ endif
 
 ###############################################################################
 # extract versions
-LV2VERSION=$(midifilter_VERSION)
+LV2VERSION=$(vslpt_VERSION)
 include git2lv2.mk
 
 # check for build-dependencies
@@ -69,92 +69,45 @@ override CFLAGS += -std=c99 `$(PKG_CONFIG) --cflags lv2`
 # build target definitions
 default: all
 
-all: $(BUILDDIR)manifest.ttl $(BUILDDIR)presets.ttl $(BUILDDIR)$(LV2NAME).ttl $(targets)
+all: $(BUILDDIR)manifest.ttl $(BUILDDIR)$(LV2NAME).ttl $(targets)
 
 FILTERS := $(wildcard filters/*.c)
 
 lv2syms:
 	echo "_lv2_descriptor" > lv2syms
 
-filters.c: $(FILTERS)
-	echo "#include \"ttf.h\"" > filters.c
-	i=0; for file in $(FILTERS); do \
-		echo "#define MFD_FILTER(FNX) MFD_FLT($$i, FNX)" >> filters.c; \
-		echo "#include \"$${file}\"" >> filters.c; \
-		echo "#undef MFD_FILTER" >> filters.c; \
-		i=`expr $$i + 1`; \
-		done;
-	echo "#define LOOP_DESC(FN) \\" >> filters.c;
-	i=0; for file in $(FILTERS); do \
-		echo "FN($$i) \\" >> filters.c; \
-		i=`expr $$i + 1`; \
-		done;
-	echo >> filters.c;
-
-$(BUILDDIR)manifest.ttl: manifest.ttl.in ttf.h filters.c presets/*.ttl
+$(BUILDDIR)manifest.ttl: manifest.ttl.in
 	@mkdir -p $(BUILDDIR)
-	cat manifest.ttl.in > $(BUILDDIR)manifest.ttl
-	gcc -E -I. -DMX_MANIFEST filters.c \
-		| grep -v '^\#' \
-		| sed "s/HTTPP/http:\//g;s/HASH/#/g;s/@LV2NAME@/$(LV2NAME)/g;s/@LIB_EXT@/$(LIB_EXT)/g" \
-		| uniq \
-		>> $(BUILDDIR)manifest.ttl
-ifneq ($(MOD),)
-	gcc -E -I. -DMX_MODGUI filters.c \
-		| grep -v '^\#' \
-		| sed "s/HTTPP/http:\//g;s/HASH/#/g;s/_DASH_/-/g;s/_DOT_/./g;" \
-		| uniq \
-		>> $(BUILDDIR)manifest.ttl
-endif
-	for file in presets/*.ttl; do grep -A 3 "mfltpreset:" $$file | sed 's/ ;/;\n\trdfs:seeAlso <presets.ttl> ./g;s/^---*//g' >> $(BUILDDIR)manifest.ttl; done
+	cat manifest.ttl.in \
+		| sed 's/@LIB_EXT@/$(LIB_EXT)/g' \
+		> $(BUILDDIR)manifest.ttl
 
-$(BUILDDIR)presets.ttl: presets.ttl.in presets/*.ttl
-	@mkdir -p $(BUILDDIR)
-	cat presets.ttl.in > $(BUILDDIR)presets.ttl
-	cat presets/*.ttl >> $(BUILDDIR)presets.ttl
-
-$(BUILDDIR)$(LV2NAME).ttl: $(LV2NAME).ttl.in ttf.h filters.c
+$(BUILDDIR)$(LV2NAME).ttl: $(LV2NAME).ttl.in
 	@mkdir -p $(BUILDDIR)
 	cat $(LV2NAME).ttl.in > $(BUILDDIR)$(LV2NAME).ttl
-	gcc -E -I. -DMX_TTF filters.c \
-		| grep -v '^\#' \
-		| sed 's/HTTPP/http:\//g;s/@VERSION@/lv2:microVersion $(LV2MIC) ;lv2:minorVersion $(LV2MIN) ;/g;s/@MODBRAND@/$(MODBRAND)/;s/$(GREPEXCL)//' \
-		| uniq \
-		>> $(BUILDDIR)$(LV2NAME).ttl
 
-$(BUILDDIR)$(LV2NAME)$(LIB_EXT): $(LV2NAME).c midifilter.h filters.c
+$(BUILDDIR)$(LV2NAME)$(LIB_EXT): $(LV2NAME).c
 	@mkdir -p $(BUILDDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) \
 	  -o $(BUILDDIR)$(LV2NAME)$(LIB_EXT) $(LV2NAME).c \
 		-shared $(LV2LDFLAGS) $(LDFLAGS) $(LOADLIBES)
-	$(STRIP) $(STRIPFLAGS) $(BUILDDIR)$(LV2NAME)$(LIB_EXT)
-
-$(BUILDDIR)modgui: modgui/
-	@mkdir -p $(BUILDDIR)/modgui
-	cp -r modgui/* $(BUILDDIR)modgui/
+#	$(STRIP) $(STRIPFLAGS) $(BUILDDIR)$(LV2NAME)$(LIB_EXT)
 
 # install/uninstall/clean target definitions
 
 install: all
 	install -d $(DESTDIR)$(LV2DIR)/$(BUNDLE)
 	install -m755 $(BUILDDIR)$(LV2NAME)$(LIB_EXT) $(DESTDIR)$(LV2DIR)/$(BUNDLE)
-	install -m644 $(BUILDDIR)manifest.ttl $(BUILDDIR)$(LV2NAME).ttl $(BUILDDIR)presets.ttl $(DESTDIR)$(LV2DIR)/$(BUNDLE)
-ifneq ($(MOD),)
-	install -d $(DESTDIR)$(LV2DIR)/$(BUNDLE)/modgui
-	install -t $(DESTDIR)$(LV2DIR)/$(BUNDLE)/modgui $(BUILDDIR)modgui/*
-endif
+	install -m644 $(BUILDDIR)manifest.ttl $(BUILDDIR)$(LV2NAME).ttl $(DESTDIR)$(LV2DIR)/$(BUNDLE)
 
 uninstall:
 	rm -f $(DESTDIR)$(LV2DIR)/$(BUNDLE)/manifest.ttl
-	rm -f $(DESTDIR)$(LV2DIR)/$(BUNDLE)/presets.ttl
 	rm -f $(DESTDIR)$(LV2DIR)/$(BUNDLE)/$(LV2NAME).ttl
 	rm -f $(DESTDIR)$(LV2DIR)/$(BUNDLE)/$(LV2NAME)$(LIB_EXT)
-	rm -rf $(DESTDIR)$(LV2DIR)/$(BUNDLE)/modgui
 	-rmdir $(DESTDIR)$(LV2DIR)/$(BUNDLE)
 
 clean:
-	rm -f $(BUILDDIR)manifest.ttl $(BUILDDIR)presets.ttl $(BUILDDIR)$(LV2NAME).ttl $(BUILDDIR)$(LV2NAME)$(LIB_EXT) lv2syms filters.c
-	rm -rf $(BUILDDIR)modgui
+	rm -f $(BUILDDIR)manifest.ttl $(BUILDDIR)$(LV2NAME).ttl $(BUILDDIR)$(LV2NAME)$(LIB_EXT) lv2syms
 	-test -d $(BUILDDIR) && rmdir $(BUILDDIR) || true
 
 .PHONY: clean all install uninstall
