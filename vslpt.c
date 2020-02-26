@@ -27,6 +27,10 @@
 #include "lv2/urid/urid.h"
 
 #define VSLPT_URI "https://github.com/ReeseWang/vslpt-lv2"
+#define VSL_FIRSTNOTE_KEYSW 0x0D
+#define VSL_RELEASE_KEYSW   0x0E
+#define VSL_REPEAT_KEYSW    0x0F
+#define VSL_INTERVAL_KEYSW_BASE 0x00
 
 typedef struct {
     LV2_URID atom_Path;
@@ -39,6 +43,45 @@ typedef struct {
     LV2_URID patch_property;
     LV2_URID patch_value;
 } VSLPTURIs;
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+enum {
+    MIDI_IN  = 0,
+    MIDI_OUT = 1
+};
+
+// Struct for a 3 byte MIDI event, used for writing notes
+typedef struct {
+    LV2_Atom_Event event;
+    uint8_t        msg[3];
+} MIDIEvent;
+
+#define NOTE_STACK_SIZE 32
+#define MIDI_CHANNELS 16
+typedef struct {
+    // Features
+    LV2_URID_Map*  map;
+    LV2_Log_Logger logger;
+
+    // Ports
+    const LV2_Atom_Sequence* in_port;
+    LV2_Atom_Sequence*       out_port;
+
+    // URIs
+    VSLPTURIs uris;
+
+    // Status
+    uint8_t note_stack[MIDI_CHANNELS][NOTE_STACK_SIZE][2];
+    uint8_t note_stack_top[MIDI_CHANNELS];
+    uint8_t active_note[MIDI_CHANNELS];
+    uint8_t control_note[MIDI_CHANNELS];
+    uint32_t out_capacity;
+    MIDIEvent evbuf;
+} VSLPT;
 
 static inline void
 map_uris(LV2_URID_Map* map, VSLPTURIs* uris)
@@ -53,29 +96,6 @@ map_uris(LV2_URID_Map* map, VSLPTURIs* uris)
     uris->patch_property     = map->map(map->handle, LV2_PATCH__property);
     uris->patch_value        = map->map(map->handle, LV2_PATCH__value);
 }
-
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-enum {
-    MIDI_IN  = 0,
-    MIDI_OUT = 1
-};
-
-typedef struct {
-    // Features
-    LV2_URID_Map*  map;
-    LV2_Log_Logger logger;
-
-    // Ports
-    const LV2_Atom_Sequence* in_port;
-    LV2_Atom_Sequence*       out_port;
-
-    // URIs
-    VSLPTURIs uris;
-} VSLPT;
 
 static void
 connect_port(LV2_Handle instance,
@@ -121,6 +141,9 @@ instantiate(const LV2_Descriptor*     descriptor,
     }
 
     map_uris(self->map, &self->uris);
+    memset(self->note_stack_top, 0, MIDI_CHANNELS);
+    memset(self->active_note, 0xFF, MIDI_CHANNELS);
+    memset(self->control_note, 0xFF, MIDI_CHANNELS);
 
     return (LV2_Handle)self;
 }
@@ -132,22 +155,142 @@ cleanup(LV2_Handle instance)
 }
 
 static void
+add_to_note_stack(VSLPT *self,
+        const uint8_t* const msg)
+{
+    uint8_t ch = msg[0] & 0x0F;
+    if (self->note_stack_top[ch] == 0)
+    {
+        self->note_stack_top[ch] = 1;
+        self->note_stack[ch][0][0] = msg[1];
+        self->note_stack[ch][0][1] = msg[2];
+    }
+    else
+    {
+        for (uint8_t i=0; i<self->note_stack_top[ch]; i++)
+            if (self->note_stack[ch][i][0] == msg[1])
+            {
+                // If has dup notes, update velocity and return
+                self->note_stack[ch][i][1] = msg[2];
+                return;
+            }
+        // If no duplicated notes, push to stack
+        self->note_stack[ch][self->note_stack_top[ch]][0] = msg[1];
+        self->note_stack[ch][self->note_stack_top[ch]][1] = msg[2];
+        self->note_stack_top[ch]++;
+    }
+}
+
+static void
+remove_from_note_stack(VSLPT *self,
+        const uint8_t* const msg)
+{
+    uint8_t ch = msg[0] & 0x0F;
+    if (self->note_stack_top[ch] != 0)
+    {
+        for (uint8_t i=0; i<self->note_stack_top[ch]; i++)
+            if (self->note_stack[ch][i][0] == msg[1])
+            {
+                // Remove from stack
+                self->note_stack_top[ch]--;
+                for (uint8_t j=i; j<self->note_stack_top[ch]; j++)
+                {
+                    self->note_stack[ch][j][0] = self->note_stack[ch][j+1][0];
+                    self->note_stack[ch][j][1] = self->note_stack[ch][j+1][1];
+                }
+            }
+    }
+}
+
+static inline void
+send_note_on(VSLPT *self, uint8_t ch, uint8_t note, uint8_t vel)
+{
+    self->evbuf.msg[0] = LV2_MIDI_MSG_NOTE_ON | (0x0F & ch);
+    self->evbuf.msg[1] = note;
+    self->evbuf.msg[2] = vel;
+    lv2_atom_sequence_append_event(
+            self->out_port, self->out_capacity, &(self->evbuf.event));
+}
+
+static inline void
+send_note_off(VSLPT *self, uint8_t ch, uint8_t note)
+{
+    self->evbuf.msg[0] = LV2_MIDI_MSG_NOTE_OFF | (0x0F & ch);
+    self->evbuf.msg[1] = note;
+    self->evbuf.msg[2] = 64;
+    lv2_atom_sequence_append_event(
+            self->out_port, self->out_capacity, &(self->evbuf.event));
+}
+
+static void
+generate_note_events(VSLPT *self,
+        const uint8_t* const msg)
+{
+    uint8_t ch = msg[0] & 0x0F;
+    if (self->active_note[ch] == 0xFF && self->note_stack_top[ch] > 0)
+    {
+        send_note_on(self, ch, VSL_FIRSTNOTE_KEYSW, 100);
+        self->control_note[ch] = VSL_FIRSTNOTE_KEYSW;
+        send_note_on(self, 
+                ch, 
+                self->note_stack[ch][self->note_stack_top[ch] - 1][0] - 24,
+                self->note_stack[ch][self->note_stack_top[ch] - 1][1]);
+        self->active_note[ch] = self->note_stack[ch][self->note_stack_top[ch] - 1][0] - 24;
+        lv2_log_note(&self->logger, "Note on %d", self->note_stack_top[ch]);
+    }
+    else if (self->active_note[ch] != 0xFF && self->note_stack_top[ch] == 0)
+    {
+        send_note_off(self, ch, self->active_note[ch]);
+        self->active_note[ch] = 0xFF;
+        send_note_off(self, ch, self->control_note[ch]);
+        self->control_note[ch] = 0xFF;
+    }
+    else if (self->active_note[ch] != 0xFF && self->note_stack_top[ch] > 0)
+    {
+        uint8_t real_last_note;
+        uint8_t next_note = self->note_stack[ch][self->note_stack_top[ch] - 1][0];
+        if (self->active_note[ch] > 72)
+            real_last_note = self->active_note[ch] - 24;
+        else
+            real_last_note = self->active_note[ch] + 24;
+        if (next_note < real_last_note)
+        {
+            send_note_off(self, ch, self->active_note[ch]);
+            send_note_off(self, ch, self->control_note[ch]);
+            send_note_on(self, ch, real_last_note - next_note, 100);
+            self->control_note[ch] = real_last_note - next_note;
+            send_note_on(self, 
+                    ch, 
+                    self->note_stack[ch][self->note_stack_top[ch] - 1][0] + 24,
+                    self->note_stack[ch][self->note_stack_top[ch] - 1][1]);
+            self->active_note[ch] = self->note_stack[ch][self->note_stack_top[ch] - 1][0] + 24;
+        }
+        else if (next_note > real_last_note)
+        {
+            send_note_off(self, ch, self->active_note[ch]);
+            send_note_off(self, ch, self->control_note[ch]);
+            send_note_on(self, ch, next_note - real_last_note, 100);
+            self->control_note[ch] = next_note - real_last_note;
+            send_note_on(self, 
+                    ch, 
+                    self->note_stack[ch][self->note_stack_top[ch] - 1][0] - 24,
+                    self->note_stack[ch][self->note_stack_top[ch] - 1][1]);
+            self->active_note[ch] = self->note_stack[ch][self->note_stack_top[ch] - 1][0] - 24;
+        }
+    }
+}
+
+static void
 run(LV2_Handle instance,
     uint32_t   sample_count)
 {
     VSLPT*     self = (VSLPT*)instance;
     VSLPTURIs* uris = &self->uris;
 
-    // Struct for a 3 byte MIDI event, used for writing notes
-    typedef struct {
-        LV2_Atom_Event event;
-        uint8_t        msg[3];
-    } MIDINoteEvent;
-
     // Initially self->out_port contains a Chunk with size set to capacity
 
     // Get the capacity
-    const uint32_t out_capacity = self->out_port->atom.size;
+    self->out_capacity = self->out_port->atom.size;
 
     // Write an empty Sequence header to the output
     lv2_atom_sequence_clear(self->out_port);
@@ -159,33 +302,33 @@ run(LV2_Handle instance,
             const uint8_t* const msg = (const uint8_t*)(ev + 1);
             switch (lv2_midi_message_type(msg)) {
             case LV2_MIDI_MSG_NOTE_ON:
+                if (msg[2] == 0) // vel=0 is a Note Off
+                    goto noteoff;
+                add_to_note_stack(self, msg);
+                goto gen_event;
             case LV2_MIDI_MSG_NOTE_OFF:
-                // Forward note to output
+noteoff:
+                remove_from_note_stack(self, msg);
+gen_event:
+                // Output note events share the same header
+                self->evbuf.event = *ev; 
+                generate_note_events(self, msg);
+                break;
+            case LV2_MIDI_MSG_CHANNEL_PRESSURE:
+                // Convert channel pressure to modulation CC
+                self->evbuf.event.time.frames = ev->time.frames; 
+                self->evbuf.event.body.type = ev->body.type;
+                self->evbuf.event.body.size = 3;
+                self->evbuf.msg[0] = LV2_MIDI_MSG_CONTROLLER | (msg[0] & 0x0F);
+                self->evbuf.msg[1] = 0x01;
+                self->evbuf.msg[2] = msg[1];
                 lv2_atom_sequence_append_event(
-                    self->out_port, out_capacity, ev);
-
-                if (msg[1] <= 127 - 7) {
-                    // Make a note one 5th (7 semitones) higher than input
-                    MIDINoteEvent fifth;
-
-                    // Could simply do fifth.event = *ev here instead...
-                    fifth.event.time.frames = ev->time.frames;  // Same time
-                    fifth.event.body.type   = ev->body.type;    // Same type
-                    fifth.event.body.size   = ev->body.size;    // Same size
-
-                    fifth.msg[0] = msg[0];      // Same status
-                    fifth.msg[1] = msg[1] + 7;  // Pitch up 7 semitones
-                    fifth.msg[2] = msg[2];      // Same velocity
-
-                    // Write 5th event
-                    lv2_atom_sequence_append_event(
-                        self->out_port, out_capacity, &fifth.event);
-                }
+                        self->out_port, self->out_capacity, &(self->evbuf.event));
                 break;
             default:
                 // Forward all other MIDI events directly
                 lv2_atom_sequence_append_event(
-                    self->out_port, out_capacity, ev);
+                    self->out_port, self->out_capacity, ev);
                 break;
             }
         }
